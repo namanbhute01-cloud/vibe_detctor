@@ -1,0 +1,4 @@
+.env
+temp_faces/
+__pycache__/
+age_net.caffemodel_/
