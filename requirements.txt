@@ -1,0 +1,17 @@
+opencv-python
+numpy
+flask
+google-api-python-client
+yt-dlp
+requests
+simplejson
+pywin32; platform_system == "Windows"
+
+opencv-python
+numpy
+flask
+google-api-python-client
+yt-dlp
+requests
+simplejson
+pycairo; platform_system == "Linux"
