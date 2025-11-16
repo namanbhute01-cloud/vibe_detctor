@@ -1,121 +1,120 @@
-# ambi_dashboard_mpv_ipc.py
+# ambi_hybrid_mpv_retry.py
 """
-Ambience detection + Flask dashboard + mpv JSON IPC + offline fallback.
+Hybrid ambience player (online-first, offline fallback) with limited retries and multi-invidious fallback.
 
-Highlights:
-- mpv controlled via JSON IPC socket (Unix) or named pipe (Windows via pywin32).
-- Reliable Play / Pause / Stop / Volume control from dashboard and preview window.
-- Offline local playlist fallback when YouTube streaming fails.
-- Detection pauses while a track is selected; staff resumes detection via dashboard button.
-- Preview OpenCV window displays camera feed and small overlay with current track info; keyboard controls included.
+Keyboard controls:
+ p = pause/resume
+ n = next (skip)
+ s = stop
+ q = quit
 
 Requirements:
-- Python 3.8+
-- mpv on PATH
-- Python packages:
-    pip install opencv-python numpy flask google-api-python-client yt-dlp
-
-- Optional on Windows (for full mpv IPC):
-    pip install pywin32
-
-Usage:
-- Put Caffe models (deploy.prototxt, res10_300x300_ssd_iter_140000.caffemodel,
-  deploy_age.prototxt, age_net.caffemodel) in the same folder.
-- Create offline_music/ and add mp3 files.
-- Set YOUTUBE_API_KEY in the script.
-- Run: python ambi_dashboard_mpv_ipc.py
-- Open dashboard: http://127.0.0.1:5000
+ pip install opencv-python numpy yt-dlp ytmusicapi mutagen Pillow
+ Install mpv and add to PATH.
+ Place DNN models next to script:
+  - deploy.prototxt
+  - res10_300x300_ssd_iter_140000.caffemodel
+  - deploy_age.prototxt
+  - age_net.caffemodel
 """
 
 import os
-import sys
 import time
-import json
 import random
 import threading
 import subprocess
+import platform
+import socket
+import traceback
 from pathlib import Path
-from urllib.parse import quote_plus
+import io
+import json
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template_string, request
-from googleapiclient.discovery import build
 import yt_dlp
-import socket
-import platform
+from ytmusicapi import YTMusic
+from mutagen import File as MutagenFile
+from PIL import Image
 
-# Try import pywin32 modules (Windows IPC). If unavailable we'll fallback.
+# ---------------- User config ----------------
+CAMERA_SOURCE = 0                        # USB camera index (0)
+CAPTURE_INTERVAL = 6.0                   # seconds between snapshots after each song cycle
+TEMP_DIR = "temp_faces"
+ROOT_MUSIC_DIR = r"C:/Users/naman/VibeMusic"  # offline root (Windows path)
+MPV_BIN = "mpv"                          # mpv on PATH
+SHUFFLE = True
+CONTINUOUS = True
+
+# Per-track limited retries (you confirmed limited retry behavior)
+MAX_PER_TRACK_RETRIES = 3
+RETRY_BACKOFF = 1.0                      # seconds multiplier between attempts
+
+# Background online retry when in offline mode
+ONLINE_RETRY_INTERVAL = 30.0             # background tries every N seconds
+
+# ytmusic / search configuration
+YT_SEARCH_CANDIDATES = 8
+
+# Invidious instances (multi-server fallback)
+INVIDIOUS_INSTANCES = [
+    "https://iv.nadeko.net/latest_version",
+    "https://invidious.snopyta.org/latest_version",
+    "https://inv.tux.pizza/latest_version",
+    "https://iv.ggtyler.dev/latest_version"
+]
+INVIDIOUS_ITAGS = [140, 251]  # try 140 (m4a) then 251 (webm opus)
+
+# Acceptable offline file extensions (play any media files)
+OFFLINE_EXTS = {".mp3", ".m4a", ".mp4", ".wav", ".flac", ".ogg", ".webm", ".mkv", ".avi", ".mov", ".opus", ".mpeg"}
+
+# DNN model filenames (must be present)
+FACE_PROTO = "deploy.prototxt"
+FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
+AGE_PROTO = "deploy_age.prototxt"
+AGE_MODEL = "age_net.caffemodel"
+AGE_MIDPOINTS = np.array([1,5,10,18,28,40,50,70], dtype=np.float32)
+
+# Ensure directories exist
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(ROOT_MUSIC_DIR, exist_ok=True)
+for g in ("kids","youths","adults","seniors"):
+    os.makedirs(Path(ROOT_MUSIC_DIR)/g, exist_ok=True)
+
+# platform / optional pywin32 for IPC
 IS_WINDOWS = platform.system().lower().startswith("windows")
 try:
     if IS_WINDOWS:
-        import win32file
-        import win32pipe
-        import pywintypes
+        import win32file  # type: ignore
         HAVE_PYWIN32 = True
     else:
         HAVE_PYWIN32 = False
 except Exception:
     HAVE_PYWIN32 = False
 
-# ---------------- Config ----------------
-CAMERA_SOURCE = 0  # replace with RTSP string if using IP camera
-CAPTURE_INTERVAL = 5.0
-TEMP_DIR = "temp_faces"
-OFFLINE_DIR = "offline_music"
+# Init YTMusic
+ytmusic = YTMusic()
 
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OFFLINE_DIR, exist_ok=True)
-
-# Models
-FACE_PROTO = "deploy.prototxt"
-FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
-AGE_PROTO  = "deploy_age.prototxt"
-AGE_MODEL  = "age_net.caffemodel"
-
-AGE_BUCKETS = ['(0-2)','(4-6)','(8-12)','(15-20)','(25-32)','(38-43)','(48-53)','(60-100)']
-AGE_MIDPOINTS = np.array([1,5,10,18,28,40,50,70], dtype=np.float32)
-
-# mpv binary (must be on PATH)
-MPV_BIN = "mpv"
-
-# YouTube API key (put your key here)
-YOUTUBE_API_KEY = "AIzaSyBolLJYQd3VQtyw0GChK8y78E3JWGgz76k"
-youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY) if YOUTUBE_API_KEY != "PASTE_YOUR_KEY_HERE" else None
-
-# Shared state
-shared = {
-    "playing": False,
-    "current_video_id": None,
-    "current_title": None,
-    "current_artist": None,
-    "shuffle": False,
-    "offline_active": False,
-    "volume": 70,
-}
-state_lock = threading.Lock()
-
-# ---------------- Helper functions ----------------
+# ---------------- DNN helpers ----------------
 def check_models():
     missing = [p for p in (FACE_PROTO, FACE_MODEL, AGE_PROTO, AGE_MODEL) if not os.path.exists(p)]
     if missing:
-        print("[ERROR] Missing model files:", missing)
-        raise SystemExit(1)
+        raise SystemExit(f"[ERROR] Missing DNN models: {missing}")
 
 def load_nets():
     face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
     age_net = cv2.dnn.readNetFromCaffe(AGE_PROTO, AGE_MODEL)
     return face_net, age_net
 
-def detect_faces_dnn(net, frame, conf_threshold=0.5):
-    h, w = frame.shape[:2]
+def detect_faces(frame, net, conf_threshold=0.5):
+    h,w = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(cv2.resize(frame,(300,300)),1.0,(300,300),(104.0,177.0,123.0))
     net.setInput(blob)
     detections = net.forward()
-    boxes = []
+    boxes=[]
     for i in range(detections.shape[2]):
         conf = float(detections[0,0,i,2])
-        if conf > conf_threshold:
+        if conf>conf_threshold:
             box = detections[0,0,i,3:7] * np.array([w,h,w,h])
             x1,y1,x2,y2 = box.astype("int")
             x1,y1 = max(0,x1), max(0,y1)
@@ -124,7 +123,7 @@ def detect_faces_dnn(net, frame, conf_threshold=0.5):
     return boxes
 
 def predict_age(age_net, face_img):
-    if face_img.size == 0:
+    if face_img.size==0:
         return None
     face_img = cv2.resize(face_img,(227,227))
     blob = cv2.dnn.blobFromImage(face_img,1.0,(227,227),(78.4263377603,87.7689143744,114.895847746), swapRB=False, crop=False)
@@ -133,522 +132,456 @@ def predict_age(age_net, face_img):
     probs = np.exp(preds - np.max(preds))
     probs /= probs.sum()
     expected_age = float((probs * AGE_MIDPOINTS).sum())
-    expected_age = np.clip(expected_age,0,100)
-    return expected_age
-
-def cleanup_temp():
-    for f in os.listdir(TEMP_DIR):
-        try:
-            os.remove(os.path.join(TEMP_DIR,f))
-        except:
-            pass
+    return float(np.clip(expected_age,0,100))
 
 def age_to_group(age):
     if age <= 12: return "kids"
-    if age <= 25: return "youth"
-    if age <= 40: return "adult"
-    if age <= 60: return "mid"
-    return "senior"
+    if age <= 25: return "youths"
+    if age <= 60: return "adults"
+    return "seniors"
 
-def fetch_song_for_group(group, max_results=6):
-    if youtube is None:
-        return None, None, None
-    queries = {
-        "kids":"popular kids songs",
-        "youth":"latest pop hits",
-        "adult":"relaxing instrumental music",
-        "mid":"soft rock classics",
-        "senior":"retro old hindi songs"
-    }
-    query = queries.get(group,"popular songs")
-    try:
-        req = youtube.search().list(part="snippet", q=query, type="video", maxResults=max_results, videoCategoryId="10")
-        res = req.execute()
-        items = res.get("items", [])
-        if not items:
-            return None,None,None
-        # choose depending on shuffle flag
-        item = random.choice(items) if shared.get("shuffle",False) else items[0]
-        title = item["snippet"]["title"]
-        artist = item["snippet"]["channelTitle"]
-        video_id = item["id"]["videoId"]
-        return video_id, title, artist
-    except Exception as e:
-        print("[YT ERROR]", e)
-        return None,None,None
+def cleanup_temp():
+    for f in os.listdir(TEMP_DIR):
+        try: os.remove(os.path.join(TEMP_DIR,f))
+        except: pass
 
-def get_offline_tracks():
-    p = Path(OFFLINE_DIR)
-    files = [str(x.resolve()) for x in p.iterdir() if x.suffix.lower() in (".mp3",".wav",".m4a",".flac",".ogg")]
-    files.sort()
+# ---------------- Offline helpers ----------------
+def list_offline_files_in_group(group):
+    p = Path(ROOT_MUSIC_DIR)/group
+    if not p.exists(): return []
+    files = [str(x.resolve()) for x in p.iterdir() if x.is_file() and x.suffix.lower() in OFFLINE_EXTS]
+    if SHUFFLE:
+        random.shuffle(files)
+    else:
+        files.sort()
     return files
 
-def choose_offline_track(shuffle=False):
-    tracks = get_offline_tracks()
-    if not tracks: return None
-    return random.choice(tracks) if shuffle else tracks[0]
+def pick_offline_file(group):
+    files = list_offline_files_in_group(group)
+    if not files: return None
+    return random.choice(files)
 
-# ---------------- mpv JSON IPC Player ----------------
-class MPVIPC:
+def extract_offline_duration(path):
+    try:
+        m = MutagenFile(path)
+        if not m or not getattr(m,'info',None): return 0
+        dur = int(getattr(m.info,'length',0) or 0)
+        return dur
+    except Exception:
+        return 0
+
+# ---------------- YTMusic + extraction ----------------
+def find_youtube_candidate(group, candidates=YT_SEARCH_CANDIDATES):
+    queries = {
+        "kids":"Kids songs",
+        "youths":"Pop music",
+        "adults":"Relaxing instrumental music",
+        "seniors":"Retro classic songs"
+    }
+    q = queries.get(group, "Popular music")
+    try:
+        results = ytmusic.search(q, filter="songs")[:candidates]
+        if not results: return None, None, None
+        choice = random.choice(results)
+        video_id = choice.get('videoId') or choice.get('id')
+        title = choice.get('title', 'YouTube')
+        artists = ", ".join([a.get('name','') for a in choice.get('artists',[])]) if choice.get('artists') else (choice.get('artist') or 'YouTube')
+        return video_id, title, artists
+    except Exception as e:
+        print("[WARN] ytmusic search failed:", e)
+        return None, None, None
+
+def extract_direct_audio_url(video_id, format_preference="bestaudio"):
+    if not video_id: return None, 0
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = {"quiet": True, "skip_download": True, "no_warnings": True, "format": format_preference}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duration = int(info.get("duration") or 0)
+            direct = info.get("url")
+            if direct:
+                return direct, duration
+            formats = info.get("formats") or []
+            audio_formats = [f for f in formats if f.get("acodec") and f.get("url") and f.get("acodec")!="none"]
+            if audio_formats:
+                audio_formats.sort(key=lambda f: ((f.get("abr") or 0) + (f.get("tbr") or 0)), reverse=True)
+                return audio_formats[0].get("url"), duration
+    except Exception as e:
+        print("[WARN] yt-dlp extract failed:", e)
+    return None, 0
+
+def build_invidious_stream(video_id):
+    """Try multiple invidious instances and itags. Return first working stream URL or None."""
+    if not video_id: return None, 0
+    for inst in INVIDIOUS_INSTANCES:
+        for itag in INVIDIOUS_ITAGS:
+            candidate = f"{inst}?id={video_id}&itag={itag}"
+            # quick basic check using yt-dlp to ensure it's playable (extract_info will usually succeed)
+            opts = {"quiet": True, "skip_download": True, "no_warnings": True}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(candidate, download=False)
+                    dur = int(info.get("duration") or 0)
+                    direct = info.get("url") or candidate
+                    # return direct or candidate; mpv tends to accept invidious direct formats directly
+                    return direct, dur
+            except Exception:
+                # try next itag/instance
+                continue
+    return None, 0
+
+# ---------------- MPV wrapper ----------------
+class MPVPlayer:
     def __init__(self, mpv_bin=MPV_BIN):
         self.mpv_bin = mpv_bin
-        self.process = None
-        self.ipc_path = None
-        self.sock = None
-        self.pipe_handle = None
-        self.lock = threading.Lock()
-        self.volume = shared.get("volume",70)
-        self.platform = platform.system().lower()
-
-    def _make_ipc_path(self):
+        self.proc = None
         pid = os.getpid()
         if IS_WINDOWS:
-            # named pipe path
-            name = f"\\\\.\\pipe\\mpv_pipe_{pid}"
-            return name
+            self.ipc_path = rf"\\.\pipe\mpvpipe_{pid}"
         else:
-            # unix domain socket path
-            return f"/tmp/mpv_socket_{pid}.sock"
+            self.ipc_path = f"/tmp/mpv_socket_{pid}.sock"
+        self.sock = None
+        self.pipe_handle = None
 
-    def _start_mpv(self, uri, is_local=False):
-        # create unique ipc path
-        self.ipc_path = self._make_ipc_path()
-        cmd = [self.mpv_bin,
-               "--no-video",
-               "--idle=no",
-               f"--volume={int(self.volume)}",
-               f"--input-ipc-server={self.ipc_path}",
-               "--force-window=no",
-               uri]
-        # start mpv
+    def play(self, uri, volume=80):
+        self.stop()
+        cmd = [
+            self.mpv_bin, uri,
+            "--no-video",
+            "--idle=yes",
+            "--keep-open=no",
+            "--no-terminal",
+            f"--volume={int(volume)}",
+            "--really-quiet",
+            f"--input-ipc-server={self.ipc_path}"
+        ]
         try:
-            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            print("[ERROR] mpv not found. Install mpv and ensure it's on PATH.")
-            self.process = None
+            print("[ERROR] mpv not found on PATH.")
+            self.proc = None
             return False
-        # connect to ipc
-        connected = False
-        for _ in range(50):
+        except Exception as e:
+            print("[ERROR] launching mpv failed:", e)
+            self.proc = None
+            return False
+
+        # best-effort IPC connect
+        for _ in range(40):
             try:
                 if IS_WINDOWS:
                     if not HAVE_PYWIN32:
-                        # can't use windows pipe without pywin32
                         break
-                    # attempt to open named pipe
-                    self.pipe_handle = win32file.CreateFile(self.ipc_path,
-                                                           win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                                                           0, None, win32file.OPEN_EXISTING, 0, None)
-                    connected = True
+                    handle = win32file.CreateFile(self.ipc_path,
+                                                  win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                                                  0, None, win32file.OPEN_EXISTING, 0, None)
+                    self.pipe_handle = handle
                     break
                 else:
-                    self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    self.sock.connect(self.ipc_path)
-                    connected = True
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect(self.ipc_path)
+                    self.sock = s
                     break
             except Exception:
                 time.sleep(0.05)
-        if not connected:
-            if IS_WINDOWS and not HAVE_PYWIN32:
-                print("[WARN] pywin32 not installed — mpv Windows IPC unavailable. Falling back to stdin/key controls.")
-            else:
-                print("[WARN] Could not connect to mpv IPC.")
+
+        time.sleep(0.3)
+        if self.proc and (self.proc.poll() is not None):
+            rc = self.proc.returncode
+            print(f"[ERROR] mpv exited immediately with code {rc}. URI probably invalid or mpv error.")
+            self.proc = None
+            return False
         return True
 
-    def start(self, uri, is_local=False, title=None, artist=None):
-        with self.lock:
-            self.stop()
-            ok = self._start_mpv(uri, is_local=is_local)
-            if ok:
-                print(f"[MPV] started {'local' if is_local else 'stream'} -> {title or uri}")
-            return ok
+    def is_playing(self):
+        return self.proc is not None and (self.proc.poll() is None)
+
+    def send(self, cmd_list):
+        payload = json.dumps({"command": cmd_list}) + "\n"
+        try:
+            if IS_WINDOWS:
+                if not HAVE_PYWIN32 or not self.pipe_handle:
+                    return False
+                win32file.WriteFile(self.pipe_handle, payload.encode("utf-8"))
+                return True
+            else:
+                if not self.sock:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect(self.ipc_path)
+                    self.sock = s
+                self.sock.sendall(payload.encode("utf-8"))
+                return True
+        except Exception:
+            return False
+
+    def toggle_pause(self):
+        return self.send(["cycle","pause"])
 
     def stop(self):
-        with self.lock:
-            if self.process:
-                # try graceful quit via IPC
+        try:
+            if self.proc:
                 try:
-                    self._send_command(["quit"])
-                except Exception:
+                    self.send(["quit"])
+                except:
                     pass
-                # give it a moment
                 try:
-                    self.process.wait(timeout=2)
-                except Exception:
-                    try: self.process.kill()
-                    except: pass
-                self.process = None
-            # clean up sockets / handles
-            try:
-                if self.sock:
-                    try: self.sock.close()
-                    except: pass
-                    self.sock = None
-                if self.pipe_handle:
-                    try: win32file.CloseHandle(self.pipe_handle)
-                    except: pass
-                    self.pipe_handle = None
-                # remove unix socket file
-                if self.ipc_path and (not IS_WINDOWS) and os.path.exists(self.ipc_path):
+                    self.proc.wait(timeout=1)
+                except:
                     try:
-                        os.remove(self.ipc_path)
+                        self.proc.terminate()
                     except:
                         pass
-            except Exception:
+        finally:
+            self.proc = None
+            try:
+                if self.sock:
+                    self.sock.close(); self.sock=None
+            except:
                 pass
-            print("[MPV] stopped")
-
-    def _send_command(self, cmd_list):
-        payload = json.dumps({"command": cmd_list}) + "\n"
-        data = payload.encode("utf-8")
-        if IS_WINDOWS:
-            if not HAVE_PYWIN32 or not self.pipe_handle:
-                raise RuntimeError("Windows pipe not available (pywin32 missing or not connected)")
-            # WriteFile requires bytes; wrap in try
-            win32file.WriteFile(self.pipe_handle, data)
-            # Not reading response; that's fine
-            return
-        else:
-            if not self.sock:
-                raise RuntimeError("IPC socket not connected")
-            self.sock.sendall(data)
-            # try to read a response non-blocking (optional)
             try:
-                self.sock.settimeout(0.1)
-                resp = self.sock.recv(4096)
-                return resp
-            except Exception:
-                return None
+                if self.pipe_handle:
+                    win32file.CloseHandle(self.pipe_handle); self.pipe_handle=None
+            except:
+                pass
+            if (not IS_WINDOWS) and os.path.exists(self.ipc_path):
+                try: os.remove(self.ipc_path)
+                except: pass
 
-    def set_property(self, prop, value):
-        try:
-            self._send_command(["set_property", prop, value])
-        except Exception as e:
-            print("[MPV] set_property error:", e)
+# ---------------- Background retry worker ----------------
+class OnlineRetryWorker(threading.Thread):
+    def __init__(self, shared_state, interval=ONLINE_RETRY_INTERVAL):
+        super().__init__(daemon=True)
+        self.shared = shared_state
+        self.interval = interval
+        self._stop = threading.Event()
 
-    def cycle_property(self, prop):
-        try:
-            self._send_command(["cycle", prop])
-        except Exception as e:
-            print("[MPV] cycle error:", e)
+    def run(self):
+        while not self._stop.is_set():
+            if self.shared.get("mode") == "offline":
+                grp = self.shared.get("last_group")
+                if grp:
+                    try:
+                        vid, title, artist = find_youtube_candidate(grp)
+                        if vid:
+                            direct, dur = extract_direct_audio_url(vid)
+                            if direct:
+                                self.shared["online_candidate"] = {"uri": direct, "title": title, "artist": artist, "duration": dur}
+                                print("[RETRY] Background found online candidate:", title)
+                                # let main loop pick it
+                    except Exception as e:
+                        print("[RETRY] background exception:", e)
+            time.sleep(self.interval)
 
-    def play_pause(self):
-        try:
-            self._send_command(["cycle", "pause"])
-        except Exception as e:
-            print("[MPV] play_pause error:", e)
+    def stop(self):
+        self._stop.set()
 
-    def set_volume(self, vol):
-        with self.lock:
-            self.volume = int(max(0,min(100,vol)))
-            try:
-                self._send_command(["set_property", "volume", self.volume])
-            except Exception as e:
-                print("[MPV] set_volume error (IPC):", e)
-                # If IPC failed, restart process with new vol (fallback)
-                if self.process:
-                    cur = shared.get("current_video_id")
-                    offline = shared.get("offline_active", False)
-                    uri = cur if offline else (f"https://www.youtube.com/watch?v={cur}" if cur else None)
-                    if uri:
-                        print("[MPV] restarting mpv to apply volume")
-                        self.start(uri, is_local=offline, title=shared.get("current_title"))
-
-    def is_playing(self):
-        return self.process is not None and (self.process.poll() is None)
-
-# Create mpv ipc player instance
-mpv_player = MPVIPC(mpv_bin=MPV_BIN)
-
-# ---------------- Flask dashboard ----------------
-app = Flask(__name__)
-INDEX_HTML = """
-<!doctype html>
-<html><head><meta charset="utf-8"><title>Ambience Dashboard</title>
-<style>body{font-family:Arial;padding:12px;background:#f5f5f5}button{padding:8px 12px;margin:4px}</style>
-</head><body>
-<h3>Ambience Dashboard (mpv IPC)</h3>
-<div><b>Current:</b> <span id="cur">No track</span></div>
-<div>
-  <button onclick="cmd('/play')">Play</button>
-  <button onclick="cmd('/pause')">Pause</button>
-  <button onclick="cmd('/next')">Next</button>
-  <button onclick="cmd('/stop')">Stop</button>
-  <button onclick="cmd('/resume')">Resume Detection</button>
-  <button onclick="cmd('/open_youtube')">Open YouTube</button>
-  <button onclick="toggleShuffle()">Shuffle: <span id='sh'>Off</span></button>
-</div>
-<div style="margin-top:8px;">Volume: <input id="vol" type="range" min="0" max="100" value="70" oninput="volChange(this.value)"><span id='v'>70</span></div>
-<pre id="st">loading...</pre>
-
-<script>
-function cmd(path){ fetch(path, {method:'POST'}).then(()=>setTimeout(status,300)); }
-function status(){ fetch('/status').then(r=>r.json()).then(j=>{ document.getElementById('st').textContent = JSON.stringify(j,null,2); document.getElementById('cur').textContent = j.current_title ? (j.current_title + ' — ' + j.current_artist) : 'No track'; document.getElementById('sh').textContent = j.shuffle ? 'On' : 'Off'; document.getElementById('vol').value = j.volume; document.getElementById('v').textContent = j.volume; }); }
-function toggleShuffle(){ fetch('/toggle_shuffle',{method:'POST'}).then(()=>setTimeout(status,200)); }
-function volChange(v){ document.getElementById('v').textContent = v; fetch('/set_volume',{method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({volume:parseInt(v)})}).then(()=>setTimeout(status,200)); }
-setInterval(status,2000); status();
-</script>
-</body></html>
-"""
-
-@app.route("/")
-def index():
-    return INDEX_HTML
-
-@app.route("/status")
-def status():
-    with state_lock:
-        return jsonify(shared)
-
-@app.route("/play", methods=["POST"])
-def route_play():
-    with state_lock:
-        vid = shared.get("current_video_id")
-        offline = shared.get("offline_active", False)
-        if not vid:
-            return ("No track",400)
-        if offline:
-            uri = vid
+# ---------------- Song preview UI + keyboard (OpenCV) ----------------
+def song_preview(title, artist, duration, player, control):
+    win = "Song Preview"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 700, 160)
+    start = time.time()
+    while not control.get("stop_event").is_set() and player.is_playing():
+        img = np.zeros((160,700,3), dtype=np.uint8)
+        cv2.putText(img, "Now Playing", (18,30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0,255,255), 2)
+        cv2.putText(img, title[:60], (18,70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        cv2.putText(img, f"by {artist[:60]}", (18,100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+        elapsed = int(time.time() - start)
+        if duration and duration>0:
+            frac = min(1.0, max(0.0, elapsed/duration))
+            text = f"{elapsed//60}:{elapsed%60:02d} / {duration//60}:{duration%60:02d}"
         else:
-            uri = f"https://www.youtube.com/watch?v={vid}"
-    # start mpv with IPC
-    mpv_player.start(uri, is_local=offline, title=shared.get("current_title"), artist=shared.get("current_artist"))
-    return ("",204)
+            frac = (elapsed%10)/10.0
+            text = f"{elapsed//60}:{elapsed%60:02d} / --:--"
+        bar_w = int(frac*640)
+        cv2.rectangle(img,(30,125),(670,135),(60,60,60),-1)
+        cv2.rectangle(img,(30,125),(30+bar_w,135),(0,200,0),-1)
+        cv2.putText(img, text, (520,98), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,200),1)
+        cv2.putText(img, "[p]=Pause [n]=Next [s]=Stop [q]=Quit", (18,145), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180,180,180),1)
+        cv2.imshow(win, img)
+        k = cv2.waitKey(200) & 0xFF
+        if k == ord('q'):
+            control['action'] = 'quit'; control['stop_event'].set(); player.stop(); break
+        if k == ord('n'):
+            control['action'] = 'next'; control['stop_event'].set(); player.stop(); break
+        if k == ord('s'):
+            control['action'] = 'stop'; control['stop_event'].set(); player.stop(); break
+        if k == ord('p'):
+            ok = player.toggle_pause()
+            if not ok:
+                print("[WARN] Pause/resume IPC not available.")
+    try: cv2.destroyWindow(win)
+    except: pass
 
-@app.route("/pause", methods=["POST"])
-def route_pause():
-    mpv_player.play_pause()
-    return ("",204)
-
-@app.route("/stop", methods=["POST"])
-def route_stop():
-    mpv_player.stop()
-    with state_lock:
-        shared["playing"]=False
-        shared["current_video_id"]=None
-        shared["current_title"]=None
-        shared["current_artist"]=None
-        shared["offline_active"]=False
-    return ("",204)
-
-@app.route("/next", methods=["POST"])
-def route_next():
-    # pick next adult online or fallback to local
-    with state_lock:
-        shared["playing"]=False
-    video_id, title, artist = fetch_song_for_group("adult")
-    if video_id:
-        with state_lock:
-            shared["current_video_id"]=video_id
-            shared["current_title"]=title
-            shared["current_artist"]=artist
-            shared["offline_active"]=False
-            shared["playing"]=True
-        uri = f"https://www.youtube.com/watch?v={video_id}"
-        mpv_player.start(uri, is_local=False, title=title, artist=artist)
-        return ("",204)
-    # offline fallback
-    track = choose_offline_track(shuffle=shared.get("shuffle",False))
-    if track:
-        with state_lock:
-            shared["current_video_id"]=track
-            shared["current_title"]=os.path.basename(track)
-            shared["current_artist"]="Local playlist"
-            shared["offline_active"]=True
-            shared["playing"]=True
-        mpv_player.start(track, is_local=True, title=shared["current_title"], artist=shared["current_artist"])
-        return ("",204)
-    return ("No track",500)
-
-@app.route("/resume", methods=["POST"])
-def route_resume():
-    with state_lock:
-        shared["playing"] = False
-    return ("",204)
-
-@app.route("/toggle_shuffle", methods=["POST"])
-def route_shuffle():
-    with state_lock:
-        shared["shuffle"] = not shared["shuffle"]
-    return ("",204)
-
-@app.route("/open_youtube", methods=["POST"])
-def route_open_yt():
-    with state_lock:
-        vid = shared.get("current_video_id")
-        offline = shared.get("offline_active", False)
-    if offline or not vid:
-        return ("No online video",400)
-    import webbrowser
-    webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
-    return ("",204)
-
-@app.route("/set_volume", methods=["POST"])
-def route_set_volume():
-    data = request.get_json() or {}
-    vol = int(data.get("volume", shared.get("volume",70)))
-    with state_lock:
-        shared["volume"]=vol
-    mpv_player.set_volume(vol)
-    return ("",204)
-
-# ---------------- Detection loop ----------------
-def draw_overlay(frame):
-    with state_lock:
-        title = shared.get("current_title") or ""
-        artist = shared.get("current_artist") or ""
-        offline = shared.get("offline_active", False)
-    h,w = frame.shape[:2]
-    overlay = np.zeros((60,w,3),dtype=np.uint8)
-    overlay[:] = (40,40,40)
-    cv2.putText(overlay, f"{title[:70]}", (8,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230,230,230),1)
-    cv2.putText(overlay, f"{artist[:60]} {'(offline)' if offline else ''}", (8,45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200),1)
-    try:
-        frame[-60:,:,:] = cv2.addWeighted(frame[-60:,:,:], 0.4, overlay, 0.6, 0)
-    except:
-        pass
-
-def wait_player_end_or_staff():
-    while True:
-        with state_lock:
-            if not shared.get("playing"):
-                mpv_player.stop()
-                break
-        if not mpv_player.is_playing():
-            with state_lock:
-                shared["playing"]=False
-                shared["offline_active"]=False
-            break
-        time.sleep(0.4)
-
-def detection_loop(camera_source=CAMERA_SOURCE, capture_interval=CAPTURE_INTERVAL):
-    print("[DETECT] starting")
+# ---------------- Main controller ----------------
+def main():
+    print("[INFO] Starting hybrid player (limited per-track retries).")
     check_models()
     face_net, age_net = load_nets()
-    cap = cv2.VideoCapture(camera_source)
+    cap = cv2.VideoCapture(CAMERA_SOURCE)
     if not cap.isOpened():
-        print("[ERROR] cannot open camera:", camera_source)
-        return
-    last_capture = 0.0
-    while True:
-        with state_lock:
-            if shared.get("playing"):
-                # show preview but don't detect heavy ops
-                ret, f = cap.read()
-                if ret:
-                    draw_overlay(f)
-                    cv2.imshow("Camera Feed (Testing)", f)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                time.sleep(0.5)
-                continue
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(1); continue
-        preview = frame.copy()
-        boxes = detect_faces_dnn(face_net, frame)
-        for (x1,y1,x2,y2,_) in boxes:
-            cv2.rectangle(preview, (x1,y1),(x2,y2),(0,255,0),2)
-        cv2.imshow("Camera Feed (Testing)", preview)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("[EXIT] quitting")
-            break
-        elif key == ord('p'):
-            mpv_player.play_pause()
-        elif key == ord('n'):
-            # call next
-            _ = route_next()
-        elif key == ord('s'):
-            _ = route_stop()
-        elif key == ord('+') or key == ord('='):
-            with state_lock:
-                shared["volume"]=min(100, shared.get("volume",70)+5)
-            mpv_player.set_volume(shared["volume"])
-        elif key == ord('-') or key == ord('_'):
-            with state_lock:
-                shared["volume"]=max(0, shared.get("volume",70)-5)
-            mpv_player.set_volume(shared["volume"])
-        now = time.time()
-        if now - last_capture < capture_interval:
-            time.sleep(0.05)
-            continue
-        last_capture = now
-        # full detection
-        boxes = detect_faces_dnn(face_net, frame)
-        print(f"[STEP] {len(boxes)} faces detected.")
-        if not boxes:
-            cleanup_temp(); continue
-        ages=[]; cleanup_temp()
-        ts = int(time.time())
-        for i,(x1,y1,x2,y2,conf) in enumerate(boxes):
-            face_img = frame[y1:y2, x1:x2]
-            if face_img.size==0: continue
-            path = os.path.join(TEMP_DIR, f"face_{ts}_{i}.jpg")
-            cv2.imwrite(path, face_img)
-            age_pred = predict_age(age_net, face_img)
-            if age_pred is not None: ages.append(age_pred)
-        if not ages:
-            print("[WARN] no ages predicted"); continue
-        avg_age = float(np.mean(ages))
-        group = age_to_group(avg_age)
-        print(f"[RESULT] Avg age: {avg_age:.1f} -> {group}")
-        # fetch song
-        video_id,title,artist = fetch_song_for_group(group)
-        used_offline = False
-        if video_id:
-            yt_url = f"https://www.youtube.com/watch?v={video_id}"
-            # try extract stream via yt-dlp
-            try:
-                with yt_dlp.YoutubeDL({'quiet': True,'format':'bestaudio'}) as ydl:
-                    info = ydl.extract_info(yt_url, download=False)
-                    stream = info.get('url') or yt_url
-            except Exception as e:
-                print("[YT-DLP] failed:", e); stream = None
-            if stream:
-                with state_lock:
-                    shared["current_video_id"]=video_id
-                    shared["current_title"]=title
-                    shared["current_artist"]=artist
-                    shared["offline_active"]=False
-                    shared["playing"]=True
-                # start mpv with IPC
-                mpv_player.start(stream, is_local=False, title=title, artist=artist)
-                wait_player_end_or_staff()
-            else:
-                used_offline=True
-        else:
-            used_offline=True
-        if used_offline:
-            track = choose_offline_track(shuffle=shared.get("shuffle",False))
-            if track:
-                with state_lock:
-                    shared["current_video_id"]=track
-                    shared["current_title"]=os.path.basename(track)
-                    shared["current_artist"]="Local playlist"
-                    shared["offline_active"]=True
-                    shared["playing"]=True
-                mpv_player.start(track, is_local=True, title=shared["current_title"], artist=shared["current_artist"])
-                wait_player_end_or_staff()
-            else:
-                print("[FALLBACK] no offline tracks found")
-                with state_lock:
-                    shared["playing"]=False
-    cap.release(); cv2.destroyAllWindows()
+        print("[ERROR] Cannot open camera:", CAMERA_SOURCE); return
 
-# ---------------- Run Flask + detection ----------------
-def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    player = MPVPlayer(mpv_bin=MPV_BIN)
+    shared = {"mode":"online","last_group":None,"online_candidate":None}
+
+    retry_worker = OnlineRetryWorker(shared_state=shared)
+    retry_worker.start()
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[WARN] Camera read failed; retrying..."); time.sleep(1); continue
+
+            boxes = detect_faces(frame, face_net)
+            if not boxes:
+                overlay = frame.copy()
+                cv2.putText(overlay,"No faces detected — waiting...", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,200,200),2)
+                cv2.imshow("Camera Preview", overlay)
+                if cv2.waitKey(1) & 0xFF == 27: break
+                time.sleep(CAPTURE_INTERVAL)
+                continue
+
+            cleanup_temp()
+            ts = int(time.time())
+            ages=[]
+            for i,(x1,y1,x2,y2,conf) in enumerate(boxes):
+                face_img = frame[y1:y2, x1:x2]
+                if face_img.size==0: continue
+                fname = os.path.join(TEMP_DIR,f"face_{ts}_{i}.jpg")
+                cv2.imwrite(fname, face_img)
+                age = predict_age(age_net, face_img)
+                if age is not None: ages.append(age)
+            if not ages:
+                print("[WARN] Age prediction failed; skipping."); time.sleep(CAPTURE_INTERVAL); continue
+
+            avg_age = float(np.mean(ages)); group = age_to_group(avg_age)
+            shared['last_group'] = group
+            print(f"[INFO] Avg age {avg_age:.1f} -> group '{group}'")
+
+            chosen_uri=None; chosen_title=None; chosen_artist=None; chosen_duration=0
+
+            # if background supplied candidate, use it first
+            candidate = shared.get("online_candidate")
+            if candidate:
+                chosen_uri = candidate.get("uri"); chosen_title = candidate.get("title"); chosen_artist = candidate.get("artist"); chosen_duration = candidate.get("duration",0)
+                shared["online_candidate"] = None
+                shared["mode"] = "online"
+                print("[INFO] Using background online candidate:", chosen_title)
+
+            # else attempt online with limited retries (MAX_PER_TRACK_RETRIES)
+            if not chosen_uri:
+                retries = 0
+                while retries < MAX_PER_TRACK_RETRIES and not chosen_uri:
+                    retries += 1
+                    print(f"[TRY] Online attempt {retries}/{MAX_PER_TRACK_RETRIES} for group {group}")
+                    vid, title, artist = find_youtube_candidate(group)
+                    if vid:
+                        # try yt-dlp extraction first (direct)
+                        direct, dur = extract_direct_audio_url(vid)
+                        if direct:
+                            chosen_uri = direct; chosen_title = title; chosen_artist = artist; chosen_duration = dur; shared["mode"]="online"
+                            print("[INFO] Found online direct stream:", chosen_title); break
+                        # else try invidious fallback across instances/itags
+                        direct_iv, dur_iv = build_invidious_stream(vid)
+                        if direct_iv:
+                            chosen_uri = direct_iv; chosen_title = title; chosen_artist = artist; chosen_duration = dur_iv; shared["mode"]="online"
+                            print("[INFO] Found invidious stream:", chosen_title); break
+                        else:
+                            print("[WARN] Extraction failed for vid", vid)
+                    else:
+                        print("[WARN] No youtube candidate found in attempt", retries)
+                    # backoff before next attempt
+                    time.sleep(RETRY_BACKOFF * retries)
+                # end retries
+
+            # If still no chosen_uri => offline fallback
+            if not chosen_uri:
+                offline_file = pick_offline_file(group)
+                if offline_file:
+                    chosen_uri = offline_file; chosen_title = Path(offline_file).name; chosen_artist = "Local"; chosen_duration = extract_offline_duration(offline_file); shared["mode"]="offline"
+                    print("[INFO] Offline fallback selected:", chosen_title)
+                else:
+                    print("[ERROR] No offline files either. Will wait and continue (background retry running).")
+                    time.sleep(CAPTURE_INTERVAL)
+                    continue
+
+            # Attempt mpv play; if fails and was online, do limited re-attempts (already tried extraction though)
+            ok = player.play(chosen_uri)
+            if not ok:
+                print("[ERROR] mpv failed to start for track. If online, try offline fallback.")
+                if shared.get("mode")=="online":
+                    offline_file = pick_offline_file(group)
+                    if offline_file:
+                        print("[INFO] Trying offline after mpv failure.")
+                        chosen_uri = offline_file; chosen_title = Path(offline_file).name; chosen_artist="Local"; chosen_duration=extract_offline_duration(offline_file); shared["mode"]="offline"
+                        ok = player.play(chosen_uri)
+                        if not ok:
+                            print("[ERROR] Offline mpv also failed. Skipping cycle.")
+                            time.sleep(CAPTURE_INTERVAL); continue
+                    else:
+                        print("[ERROR] No offline files; skipping.")
+                        time.sleep(CAPTURE_INTERVAL); continue
+                else:
+                    print("[ERROR] mpv couldn't start offline file as well; skipping.")
+                    time.sleep(CAPTURE_INTERVAL); continue
+
+            # Launch song preview UI thread
+            control = {"stop_event": threading.Event(), "action": None}
+            ui_th = threading.Thread(target=song_preview, args=(chosen_title or "Unknown", chosen_artist or "", chosen_duration, player, control), daemon=True)
+            ui_th.start()
+
+            # While playing show camera snapshot + handle keyboard controls
+            while player.is_playing():
+                vis = frame.copy()
+                for (x1,y1,x2,y2,_) in boxes:
+                    cv2.rectangle(vis,(x1,y1),(x2,y2),(0,255,0),2)
+                cv2.putText(vis, f"Group:{group} Age:{avg_age:.1f} Mode:{shared.get('mode')}", (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0),2)
+                cv2.putText(vis, f"Now: {chosen_title or '---'}",(10,45),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,200),1)
+                cv2.imshow("Camera Preview", vis)
+                k = cv2.waitKey(120) & 0xFF
+
+                if k == ord('p'):
+                    ok = player.toggle_pause()
+                    if not ok:
+                        print("[CTRL] Pause/resume IPC not available.")
+                elif k == ord('n'):
+                    print("[CTRL] Next pressed."); player.stop(); control["stop_event"].set(); break
+                elif k == ord('s'):
+                    print("[CTRL] Stop pressed."); player.stop(); control["stop_event"].set(); break
+                elif k == ord('q'):
+                    print("[CTRL] Quit pressed. Exiting."); player.stop(); control["stop_event"].set(); cap.release(); cv2.destroyAllWindows(); retry_worker.stop(); return
+
+                if control.get("action"):
+                    action = control["action"]
+                    if action in ("next","skip","stop","quit"):
+                        print("[CTRL] action from song preview:", action)
+                        control["action"] = None
+                        player.stop()
+                        control["stop_event"].set()
+                        break
+
+            control["stop_event"].set()
+            player.stop()
+            print("[INFO] Playback finished; waiting", CAPTURE_INTERVAL, "s before next cycle.")
+            time.sleep(CAPTURE_INTERVAL)
+            if not CONTINUOUS:
+                break
+
+    except KeyboardInterrupt:
+        print("[INFO] Keyboard interrupt; stopping.")
+    except Exception as e:
+        print("[ERROR] exception in main:", e); traceback.print_exc()
+    finally:
+        try: player.stop()
+        except: pass
+        retry_worker.stop()
+        try: cap.release()
+        except: pass
+        try: cv2.destroyAllWindows()
+        except: pass
 
 if __name__ == "__main__":
-    # Warn about pywin32 on Windows if missing
-    if IS_WINDOWS and not HAVE_PYWIN32:
-        print("[WARN] pywin32 not found. For best mpv control on Windows install pywin32: pip install pywin32")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    try:
-        detection_loop()
-    except KeyboardInterrupt:
-        print("[EXIT] Keyboard interrupt")
-        mpv_player.stop()
-        os._exit(0)
+    main()
