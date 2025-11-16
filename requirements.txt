@@ -14,4 +14,8 @@ google-api-python-client
 yt-dlp
 requests
 simplejson
+<<<<<<< HEAD
 pycairo; platform_system == "Linux"
+=======
+pycairo; platform_system == "Linux"
+>>>>>>> 77b22e97447c87bbdd11c923cc842b4c34ecd96a
